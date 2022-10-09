@@ -26,3 +26,6 @@ CMakeLists.txt.user*
 .idea
 /cmake-build*
 .cache
+
+# Added by Droidian
+!.circleci/
