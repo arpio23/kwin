@@ -477,8 +477,8 @@ int main(int argc, char *argv[])
             qInfo("No backend specified, automatically choosing X11 because DISPLAY is set");
             backendType = BackendType::X11;
         } else {
-            qInfo("No backend specified, automatically choosing drm");
-            backendType = BackendType::Kms;
+            qWarning("No backend specified, automatically choosing hwcomposer");
+            backendType = BackendType::Hwcomposer;
         }
     }
 
