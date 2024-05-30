@@ -15,6 +15,7 @@
 #include "backends/wayland/wayland_backend.h"
 #include "backends/x11/windowed/x11_windowed_backend.h"
 #include "compositor_wayland.h"
+#include "composite.h"
 #include "core/outputbackend.h"
 #include "core/session.h"
 #include "effect/effecthandler.h"
@@ -321,6 +322,7 @@ int main(int argc, char *argv[])
                                             i18n("The Wayland Display to use in windowed mode on platform Wayland."),
                                             QStringLiteral("display"));
     QCommandLineOption virtualFbOption(QStringLiteral("virtual"), i18n("Render to a virtual framebuffer."));
+    QCommandLineOption hwcomposerFbOption(QStringLiteral("hwcomposer"), "Render through hwc");
     QCommandLineOption widthOption(QStringLiteral("width"),
                                    i18n("The width for windowed mode. Default width is 1024."),
                                    QStringLiteral("width"));
@@ -377,6 +379,7 @@ int main(int argc, char *argv[])
     parser.addOption(x11DisplayOption);
 #endif
     parser.addOption(waylandDisplayOption);
+    parser.addOption(hwcomposerFbOption);
     parser.addOption(virtualFbOption);
     parser.addOption(widthOption);
     parser.addOption(heightOption);
@@ -443,6 +446,7 @@ int main(int argc, char *argv[])
         Kms,
         X11,
         Wayland,
+        Hwcomposer,
         Virtual,
     };
 
@@ -461,6 +465,8 @@ int main(int argc, char *argv[])
 #endif
     } else if (parser.isSet(waylandDisplayOption)) {
         backendType = BackendType::Wayland;
+    } else if (parser.isSet(hwcomposerFbOption)) {
+        backendType = BackendType::Hwcomposer;
     } else if (parser.isSet(virtualFbOption)) {
         backendType = BackendType::Virtual;
     } else {
@@ -556,6 +562,14 @@ int main(int argc, char *argv[])
         }));
         break;
     }
+    case BackendType::Hwcomposer:
+        a.setSession(KWin::Session::create());
+        if (!a.session()) {
+            std::cerr << "FATAl ERROR: could not acquire a session" << std::endl;
+            return 1;
+        }
+        a.setOutputBackend(std::make_unique<KWin::HwcomposerBackend>(a.session()));
+        break;
     }
 
     KWin::WaylandServer *server = KWin::WaylandServer::create();
