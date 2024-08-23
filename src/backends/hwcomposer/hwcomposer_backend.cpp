@@ -19,6 +19,7 @@
 #include <sync/sync.h>
 
 #include "core/renderloop_p.h"
+#include "opengl/egldisplay.h"
 
 
 namespace KWin {
@@ -31,8 +32,8 @@ HwcomposerBackend::HwcomposerBackend(Session *session, QObject *parent)
 
 HwcomposerBackend::~HwcomposerBackend()
 {
-    if (sceneEglDisplay() != EGL_NO_DISPLAY) {
-        eglTerminate(sceneEglDisplay());
+    if (sceneEglDisplayObject() != EGL_NO_DISPLAY) {
+        eglTerminate(sceneEglDisplayObject());
     }
 }
 
@@ -91,7 +92,7 @@ bool HwcomposerBackend::initialize()
     for (int i = 0; i < 5 * 1000; ++i) {
         // Wait at most 5s for hotplug events
         if (hwc2_compat_device_get_display_by_id(m_hwc2device, 0))
-        break;
+            break;
         usleep(1000);
     }
 
@@ -100,10 +101,10 @@ bool HwcomposerBackend::initialize()
 
 std::unique_ptr<OpenGLBackend> HwcomposerBackend::createOpenGLBackend()
 {
-    return std::make_unique<EglHwcomposerBackend>(this);
+    return std::make_unique<EglHwcBackend>(this);
 }
 
-std::unique_ptr<InputBackend>HwcomposerBackend::createInputBackend()
+std::unique_ptr<InputBackend> HwcomposerBackend::createInputBackend()
 {
     return std::make_unique<LibinputBackend>(m_session);
 }
@@ -111,9 +112,22 @@ std::unique_ptr<InputBackend>HwcomposerBackend::createInputBackend()
 Outputs HwcomposerBackend::outputs() const
 {
     QVector<HwcomposerOutput *> outputs;
-
-    for (const auto &out : m_outputs)
+    int count = 0;
+    for (const auto &out : m_outputs){
+        count++;
         outputs.push_back(out.second.get());
+    }
+    return outputs;
+}
+
+QList<HwcomposerOutput *> HwcomposerBackend::hwcOutputs()
+{
+    QList<HwcomposerOutput *> outputs;
+    int count = 0;
+    for (const auto &out : m_outputs){
+        count++;
+        outputs.push_back(out.second.get());
+    }
     return outputs;
 }
 
@@ -134,13 +148,23 @@ void HwcomposerBackend::clearDpmsFilter()
 
 void HwcomposerBackend::wakeVSync(hwc2_display_t display, int64_t timestamp)
 {
+    qCWarning(KWIN_HWCOMPOSER) << "HwcomposerBackend::wakeVSync(hwc2_display_t display, int64_t timestamp)";
     if (m_outputs.find(display) != m_outputs.end())
         m_outputs[display]->handleVSync(timestamp);
 }
 
+EglDisplay *HwcomposerBackend::sceneEglDisplayObject() const
+{
+    return m_display.get();
+}
+
+void HwcomposerBackend::setEglDisplay(std::unique_ptr<EglDisplay> &&display)
+{
+    m_display = std::move(display);
+}
+
 void HwcomposerBackend::handleHotplug(hwc2_display_t display, bool connected, bool primaryDisplay)
 {
-    qCInfo(KWIN_HWCOMPOSER) << "Hotplug Display: " << display << ", connected: " << connected << ", isPrimary: " << primaryDisplay;
     if (connected) {
         if (m_outputs.find(display) == m_outputs.end()) {
             createOutput(display);
@@ -164,7 +188,7 @@ void HwcomposerBackend::updateOutputState(hwc2_display_t display)
 
 HwcomposerOutput::HwcomposerOutput(HwcomposerBackend *backend, hwc2_display_t display)
     : Output(backend)
-    , m_renderLoop(std::make_unique<RenderLoop>())
+    , m_renderLoop(std::make_unique<RenderLoop>(nullptr))
     , m_backend(backend)
     , m_displayId(display)
 {
@@ -201,11 +225,11 @@ HwcomposerOutput::HwcomposerOutput(HwcomposerBackend *backend, hwc2_display_t di
         .serialNumber = QString(),
         .eisaId = QString(),
         .physicalSize = physicalSize.toSize(),
-        .edid = QByteArray(),
+        .edid = Edid(),
         .subPixel = SubPixel::Unknown,
         .capabilities = Capability::Dpms,
-        .panelOrientation = KWin::Output::Transform::Normal,
-        .internal = false,
+        .panelOrientation = OutputTransform::Normal,
+        .internal = true,
         .nonDesktop = false,
     });
 
@@ -251,7 +275,7 @@ void HwcomposerOutput::setDpmsMode(DpmsMode mode)
 
 void HwcomposerOutput::updateDpmsMode(DpmsMode dpmsMode)
 {
-    setPowerMode(dpmsMode == DpmsMode::On);
+    setPowerMode(dpmsMode == DpmsMode::Off);
 
     State next = m_state;
     next.dpmsMode = dpmsMode;
@@ -364,21 +388,21 @@ void HwcomposerOutput::setPowerMode(bool enable)
     hwc2_compat_display_set_power_mode(m_display, enable ? HWC2_POWER_MODE_ON : HWC2_POWER_MODE_OFF);
 }
 
-QVector<int32_t> HwcomposerOutput::regionToRects(const QRegion &region) const
-{
-    const int height = pixelSize().height();
-    const QMatrix4x4 matrix = Output::logicalToNativeMatrix(rect(), scale(), transform());
-    QVector<EGLint> rects;
-    rects.reserve(region.rectCount() * 4);
-    for (const QRect &_rect : region) {
-        const QRect rect = matrix.mapRect(_rect);
-        rects << rect.left();
-        rects << height - (rect.y() + rect.height());
-        rects << rect.width();
-        rects << rect.height();
-    }
-    return rects;
-}
+// QVector<int32_t> HwcomposerOutput::regionToRects(const QRegion &region) const
+// {
+//     const int height = pixelSize().height();
+//     const QMatrix4x4 matrix = Output::logicalToNativeMatrix(rect(), scale(), transform());
+//     QVector<EGLint> rects;
+//     rects.reserve(region.rectCount() * 4);
+//     for (const QRect &_rect : region) {
+//         const QRect rect = matrix.mapRect(_rect);
+//         rects << rect.left();
+//         rects << height - (rect.y() + rect.height());
+//         rects << rect.width();
+//         rects << rect.height();
+//     }
+//     return rects;
+// }
 
 void HwcomposerOutput::compositing(int flags)
 {
@@ -391,12 +415,16 @@ void HwcomposerOutput::compositing(int flags)
 
             if ((next_vsync - now) <= m_idle_time) {
                 // Too close! Sad
+                qCWarning(KWIN_HWCOMPOSER) << "Too close! Sad";
                 std::chrono::nanoseconds ntimestamp(next_vsync + m_vsyncPeriod - m_idle_time);
-                renderLoopPrivate->notifyFrameCompleted(ntimestamp);
+                //m_frame->presented(ntimestamp, PresentationMode::VSync);
+                //renderLoopPrivate->notifyFrameCompleted(ntimestamp);
             } else {
                 // We can go ahead
+                qCWarning(KWIN_HWCOMPOSER) << "We can go ahead";
                 std::chrono::nanoseconds ntimestamp(next_vsync - m_idle_time);
-                renderLoopPrivate->notifyFrameCompleted(ntimestamp);
+                //m_frame->presented(ntimestamp, PresentationMode::VSync);
+                //renderLoopPrivate->notifyFrameCompleted(ntimestamp);
             }
         }
     }

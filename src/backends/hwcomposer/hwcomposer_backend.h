@@ -13,6 +13,7 @@
 #include "core/output.h"
 #include "core/outputbackend.h"
 #include "core/renderloop.h"
+#include "core/outputlayer.h"
 
 #include "dpmsinputeventfilter.h"
 #include "input.h"
@@ -55,7 +56,7 @@ public:
     HwcomposerWindow *createSurface();
     void enableVSync(bool enable);
     void setPowerMode(bool enable);
-    QVector<int32_t> regionToRects(const QRegion &region) const;
+    // QVector<int32_t> regionToRects(const QRegion &region) const;
 
     hwc2_compat_display_t *hwc2_display() const
     {
@@ -98,12 +99,16 @@ public:
     std::unique_ptr<OpenGLBackend> createOpenGLBackend() override;
     std::unique_ptr<InputBackend> createInputBackend() override;
     Outputs outputs() const override;
+    QList<HwcomposerOutput *> hwcOutputs();
     void createDpmsFilter();
     void clearDpmsFilter();
 
     void wakeVSync(hwc2_display_t display, int64_t timestamp);
     void handleHotplug(hwc2_display_t display, bool connected, bool primaryDisplay);
     void updateOutputState(hwc2_display_t display);
+
+    EglDisplay *sceneEglDisplayObject() const override;
+    void setEglDisplay(std::unique_ptr<EglDisplay> &&display);
 
     QVector<CompositingType> supportedCompositors() const override
     {
@@ -122,7 +127,8 @@ private:
     std::map<hwc2_display_t, std::unique_ptr<HwcomposerOutput>> m_outputs;
     hwc2_compat_device_t *m_hwc2device = nullptr;
     std::unique_ptr<DpmsInputEventFilter> m_dpmsFilter;
-
+    std::unique_ptr<EglDisplay> m_display;
+    
     Session *m_session;
 };
 

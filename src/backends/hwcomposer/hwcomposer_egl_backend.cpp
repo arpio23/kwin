@@ -1,80 +1,199 @@
+/*
+    SPDX-FileCopyrightText: 2010, 2012 Martin Gräßlin <mgraesslin@kde.org>
+    SPDX-FileCopyrightText: 2020 Vlad Zahorodnii <vlad.zahorodnii@kde.org>
+
+    SPDX-License-Identifier: GPL-2.0-or-later
+*/
+
 #include "hwcomposer_egl_backend.h"
 #include "hwcomposer_backend.h"
 #include "hwcomposer_logging.h"
-#include <kwinglplatform.h>
-#include <kwinglutils.h>
-#include <kwineglimagetexture.h>
-#include "basiceglsurfacetexture_internal.h"
-#include "basiceglsurfacetexture_wayland.h"
-#include "openglbackend.h"
-#include "kwineglutils_p.h"
+#include <opengl/glplatform.h>
+#include <opengl/glutils.h>
+#include <opengl/eglimagetexture.h>
+#include "platformsupport/scenes/opengl/basiceglsurfacetexture_wayland.h"
+#include "platformsupport/scenes/opengl/openglbackend.h"
+#include "opengl/glrendertimequery.h"
+#include <opengl/eglutils_p.h>
 #include <memory>
+
+#include "core/outputbackend.h"
+#include "core/outputlayer.h"
+#include "core/overlaywindow.h"
+#include "core/renderloop_p.h"
+#include "opengl/eglcontext.h"
+#include "opengl/egldisplay.h"
+#include "opengl/glplatform.h"
+#include "opengl/glrendertimequery.h"
+#include "options.h"
+#include <QOpenGLContext>
 
 namespace KWin
 {
 
-EglHwcomposerBackend::EglHwcomposerBackend(HwcomposerBackend *backend)
-    : AbstractEglBackend()
+EglHwcOutputLayer::EglHwcOutputLayer(EglHwcBackend *backend)
+    : OutputLayer(nullptr)
     , m_backend(backend)
 {
-    setIsDirectRendering(true);
-    setSupportsNativeFence(true);
-
-    connect(m_backend, &HwcomposerBackend::outputAdded, this, &EglHwcomposerBackend::createEglHwcomposerOutput);
-    connect(m_backend, &HwcomposerBackend::outputRemoved, this, [this](Output *output) {
-        m_outputs.erase(output);
-    });
-
-    init();
 }
 
-EglHwcomposerBackend::~EglHwcomposerBackend()
+std::optional<OutputLayerBeginFrameInfo> EglHwcOutputLayer::doBeginFrame()
 {
-    cleanup();
+    return m_backend->beginFrame();
 }
 
-void EglHwcomposerBackend::cleanupSurfaces()
+bool EglHwcOutputLayer::doEndFrame(const QRegion &renderedRegion, const QRegion &damagedRegion, OutputFrame *frame)
 {
-    m_outputs.clear();
-}
-
-bool EglHwcomposerBackend::createEglHwcomposerOutput(Output *output)
-{
-    m_outputs[output] = std::make_unique<EglHwcomposerOutput>(static_cast<HwcomposerOutput *>(output), this);
+    m_backend->endFrame(renderedRegion, damagedRegion, frame);
     return true;
 }
 
-bool EglHwcomposerBackend::initializeEgl()
+DrmDevice *EglHwcOutputLayer::scanoutDevice() const
 {
-    qputenv("EGL_PLATFORM", QByteArrayLiteral("hwcomposer"));
-    EGLDisplay display = m_backend->sceneEglDisplay();
-
-    if (display == EGL_NO_DISPLAY) {
-        display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
-    }
-    if (display == EGL_NO_DISPLAY) {
-        return false;
-    }
-    setEglDisplay(display);
-    return initEglAPI();
+    return nullptr;
 }
 
-void EglHwcomposerBackend::init()
+QHash<uint32_t, QList<uint64_t>> EglHwcOutputLayer::supportedDrmFormats() const
 {
-    if (!initializeEgl()) {
-        setFailed("Failed to initialize egl");
+    return {};
+}
+
+EglHwcBackend::EglHwcBackend(HwcomposerBackend *backend)
+    : m_backend(backend)
+{
+    connect(m_backend, &HwcomposerBackend::outputAdded, this, &EglHwcBackend::createEglHwcOutputLayer);
+    connect(m_backend, &HwcomposerBackend::outputRemoved, this, [this](Output *output) {
+        m_outputs.erase(output);
+    });
+}
+
+EglHwcBackend::~EglHwcBackend()
+{
+    // No completion events will be received for in-flight frames, this may lock the
+    // render loop. We need to ensure that the render loop is back to its initial state
+    // if the render backend is about to be destroyed.
+    // RenderLoopPrivate::get(m_backend->renderLoop())->invalidate();
+
+    m_query.reset();
+
+    if (isFailed() && m_overlayWindow) {
+        m_overlayWindow->destroy();
+    }
+    if (m_surface != EGL_NO_SURFACE) {
+        eglDestroySurface(eglDisplayObject()->handle(), m_surface);
+    }
+    m_context.reset();
+}
+
+bool EglHwcBackend::createEglHwcOutputLayer(Output *output)
+{
+    m_outputs[output] = std::make_unique<EglHwcOutputLayer>(this);
+    return true;
+}
+
+std::unique_ptr<SurfaceTexture> EglHwcBackend::createSurfaceTextureWayland(SurfacePixmap *pixmap)
+{
+    return std::make_unique<BasicEGLSurfaceTextureWayland>(this, pixmap);
+}
+
+void EglHwcBackend::init()
+{
+    qputenv("EGL_PLATFORM", QByteArrayLiteral("hwcomposer"));
+
+    if (!m_backend->sceneEglDisplayObject()) {
+        m_backend->setEglDisplay(EglDisplay::create(eglGetDisplay(EGL_DEFAULT_DISPLAY)));
+    }
+
+    if (m_backend->sceneEglDisplayObject() == EGL_NO_DISPLAY) {
+        setFailed(QStringLiteral("Failed to create display"));
         return;
     }
+
     if (!initRenderingContext()) {
         setFailed("Could not initialize rendering context");
         return;
     }
-    initKWinGL();
-    initBufferAge();
-    initWayland();
 }
 
-bool EglHwcomposerBackend::initBufferConfigs()
+void EglHwcBackend::initClientExtensions()
+{
+    // Get the list of client extensions
+    // const char *clientExtensionsCString = eglQueryString(EGL_NO_DISPLAY, EGL_EXTENSIONS);
+    // const QByteArray clientExtensionsString = QByteArray::fromRawData(clientExtensionsCString, qstrlen(clientExtensionsCString));
+    // if (clientExtensionsString.isEmpty()) {
+    //     // If eglQueryString() returned NULL, the implementation doesn't support
+    //     // EGL_EXT_client_extensions. Expect an EGL_BAD_DISPLAY error.
+    //     (void)eglGetError();
+    // }
+
+    // m_clientExtensions = clientExtensionsString.split(' ');
+}
+
+bool EglHwcBackend::hasClientExtension(const QByteArray &name)
+{
+    qCWarning(KWIN_HWCOMPOSER) << "EglHwcBackend::hasClientExtension(const QByteArray &name)";
+    // return m_clientExtensions.contains(name);
+    return false;
+}
+
+bool EglHwcBackend::initRenderingContext()
+{
+    // initClientExtensions();
+    auto display = m_backend->sceneEglDisplayObject();
+
+    setSupportsBufferAge(display->supportsBufferAge());
+    setSupportsNativeFence(display->supportsNativeFence());
+    setExtensions(display->extensions());
+    static std::unique_ptr<EglContext> s_globalShareContext;
+
+    if (!s_globalShareContext) {
+        s_globalShareContext = EglContext::create(m_backend->sceneEglDisplayObject(), chooseBufferConfig(), EGL_NO_CONTEXT);
+    }
+    if (s_globalShareContext) {
+        m_backend->setSceneEglGlobalShareContext(s_globalShareContext->handle());
+    }
+
+    m_context = EglContext::create(display, chooseBufferConfig(), m_backend->sceneEglGlobalShareContext());
+    if (!m_context) {
+        qCCritical(KWIN_CORE) << "Create OpenGL context failed";
+        return false;
+    }
+
+    m_surface = createSurface();
+    if (m_surface == EGL_NO_SURFACE) {
+        qCCritical(KWIN_CORE) << "Creating egl surface failed";
+        return false;
+    }
+
+    if (!makeCurrent()) {
+        qCCritical(KWIN_CORE) << "Make Context Current failed";
+        return false;
+    }
+
+    EGLint error = eglGetError();
+    if (error != EGL_SUCCESS) {
+        qCWarning(KWIN_CORE) << "Error occurred while creating context " << error;
+        return false;
+    }
+    return true;
+}
+
+EGLSurface EglHwcBackend::createSurface()
+{
+    EGLSurface surface = EGL_NO_SURFACE;
+
+    if(m_outputs.size() < 1){
+        m_outputs[m_backend->hwcOutputs().first()] = std::make_unique<EglHwcOutputLayer>(this);
+    }
+    
+    surface = eglCreateWindowSurface(eglDisplayObject()->handle(), chooseBufferConfig(), (EGLNativeWindowType) static_cast<ANativeWindow *>(m_backend->hwcOutputs().first()->createSurface()), nullptr);
+
+    m_fbo = std::make_unique<GLFramebuffer>(0, m_backend->hwcOutputs().first()->pixelSize());
+
+    return surface;
+}
+
+EGLConfig EglHwcBackend::chooseBufferConfig()
 {
     const EGLint config_attribs[] = {
         EGL_RED_SIZE,             8,
@@ -88,162 +207,113 @@ bool EglHwcomposerBackend::initBufferConfigs()
 
     EGLint count;
     EGLConfig configs[1024];
-    if (eglChooseConfig(eglDisplay(), config_attribs, configs, 1024, &count) == EGL_FALSE) {
+    if (eglChooseConfig(eglDisplayObject()->handle(), config_attribs, configs, 1024, &count) == EGL_FALSE) {
         qCCritical(KWIN_HWCOMPOSER) << "choose config failed";
-        return false;
+        return EGL_NO_CONFIG_KHR;
     }
     if (count == 0) {
         qCCritical(KWIN_HWCOMPOSER) << "choose config did not return a config";
-        return false;
+        return EGL_NO_CONFIG_KHR;
     }
-    setConfig(configs[0]);
-
-    return true;
+    return configs[0];
 }
 
-bool EglHwcomposerBackend::initRenderingContext()
+OutputLayerBeginFrameInfo EglHwcBackend::beginFrame()
 {
-    if (!initBufferConfigs()) {
-        return false;
+    makeCurrent();
+
+    QRegion repaint;
+    if (supportsBufferAge()) {
+        repaint = m_damageJournal.accumulate(m_bufferAge, infiniteRegion());
     }
+    eglWaitNative(EGL_CORE_NATIVE_ENGINE);
 
-    if (!createContext()) {
-        return false;
-    }
+    m_query = std::make_unique<GLRenderTimeQuery>(m_context);
+    m_query->begin();
 
-    auto hwcOutputs = m_backend->outputs();
-
-    // we only allow to start with at least one output
-    if (hwcOutputs.isEmpty()) {
-        return false;
-    }
-
-    for (auto *out : hwcOutputs) {
-        if (!createEglHwcomposerOutput(out)) {
-            return false;
-        }
-    }
-
-    if (m_outputs.empty()) {
-        qCCritical(KWIN_HWCOMPOSER) << "Create Window Surfaces failed";
-        return false;
-    }
-
-    return makeCurrent();
+    return OutputLayerBeginFrameInfo{
+        .renderTarget = RenderTarget(m_fbo.get()),
+        .repaint = repaint,
+    };
 }
 
-void EglHwcomposerBackend::present(Output *output)
+void EglHwcBackend::endFrame(const QRegion &renderedRegion, const QRegion &damagedRegion, OutputFrame *frame)
 {
-    if (!output) {
-        return;
+    m_query->end();
+    frame->addRenderTimeQuery(std::move(m_query));
+    // Save the damaged region to history
+    if (supportsBufferAge()) {
+        m_damageJournal.add(damagedRegion);
     }
+    m_lastRenderedRegion = renderedRegion;
+}
 
-    m_outputs[output]->present();
+void EglHwcBackend::present(Output *output, const std::shared_ptr<OutputFrame> &frame)
+{
+    const bool correct = eglSwapBuffers(m_backend->sceneEglDisplayObject()->handle(), m_surface);
+    if (!correct) {
+        qCWarning(KWIN_HWCOMPOSER) << "eglSwapBuffers failed:" << getEglErrorString() << m_surface;
+    }
     static_cast<HwcomposerOutput *>(output)->notifyFrame();
+    //presentSurface(m_surface, effectiveRenderedRegion, workspace()->geometry());
 }
 
-std::unique_ptr<SurfaceTexture> EglHwcomposerBackend::createSurfaceTextureInternal(SurfacePixmapInternal *pixmap)
+void EglHwcBackend::presentSurface(EGLSurface surface, const QRegion &damage, const QRect &screenGeometry)
 {
-    return std::make_unique<BasicEGLSurfaceTextureInternal>(this, pixmap);
+    // const bool fullRepaint = supportsBufferAge() || (damage == screenGeometry);
+
+    // if (fullRepaint || !m_havePostSubBuffer) {
+    //     // the entire screen changed, or we cannot do partial updates (which implies we enabled surface preservation)
+    //     eglSwapBuffers(eglDisplayObject()->handle(), surface);
+    //     if (supportsBufferAge()) {
+    //         eglQuerySurface(eglDisplayObject()->handle(), surface, EGL_BUFFER_AGE_EXT, &m_bufferAge);
+    //     }
+    // } else {
+    //     // a part of the screen changed, and we can use eglPostSubBufferNV to copy the updated area
+    //     for (const QRect &r : damage) {
+    //         eglPostSubBufferNV(eglDisplayObject()->handle(), surface, r.left(), screenGeometry.height() - r.bottom() - 1, r.width(), r.height());
+    //     }
+    // }
 }
 
-std::unique_ptr<SurfaceTexture> EglHwcomposerBackend::createSurfaceTextureWayland(SurfacePixmapWayland *pixmap)
+OverlayWindow *EglHwcBackend::overlayWindow() const
 {
-    return std::make_unique<BasicEGLSurfaceTextureWayland>(this, pixmap);
+    return m_overlayWindow.get();
 }
 
-OutputLayer* EglHwcomposerBackend::primaryLayer(Output *output)
+OutputLayer *EglHwcBackend::primaryLayer(Output *output)
 {
     if (!output) {
         return nullptr;
     }
-
     return m_outputs[output].get();
 }
 
-EglHwcomposerOutput::EglHwcomposerOutput(HwcomposerOutput *output, EglHwcomposerBackend *backend)
-    : m_output(output), m_backend(backend)
+void EglHwcBackend::vblank(std::chrono::nanoseconds timestamp)
 {
-    m_nativeSurface = m_output->createSurface();
-    m_surface = eglCreateWindowSurface(m_backend->eglDisplay(), m_backend->config(), (EGLNativeWindowType) static_cast<ANativeWindow *>(m_nativeSurface), nullptr);
-    if (m_surface == EGL_NO_SURFACE) {
-        qCCritical(KWIN_HWCOMPOSER) << "Create surface failed";
-        return;
-    }
-
-    m_framebuffer = std::make_unique<GLFramebuffer>(0, m_output->pixelSize());
+    qCWarning(KWIN_HWCOMPOSER) << "EglHwcBackend::vblank(std::chrono::nanoseconds timestamp)";
+    // m_frame->presented(timestamp, PresentationMode::VSync);
+    // m_frame.reset();
 }
 
-EglHwcomposerOutput::~EglHwcomposerOutput()
+EglDisplay *EglHwcBackend::eglDisplayObject() const
 {
-    if (m_surface != EGL_NO_SURFACE) {
-        eglDestroySurface(m_backend->eglDisplay(), m_surface);
-    }
+    return m_backend->sceneEglDisplayObject();
 }
 
-bool EglHwcomposerOutput::makeContextCurrent() const
+OpenGlContext *EglHwcBackend::openglContext() const
 {
-    if (eglMakeCurrent(m_backend->eglDisplay(), surface(), surface(), m_backend->context()) == EGL_FALSE) {
-        qCCritical(KWIN_HWCOMPOSER) << "eglMakeCurrent failed:" << getEglErrorString();
-        return false;
-    }
-    return true;
+    return m_context.get();
 }
 
-std::optional<OutputLayerBeginFrameInfo> EglHwcomposerOutput::beginFrame()
+bool EglHwcBackend::makeCurrent()
 {
-    if (!makeContextCurrent()) {
-        return std::nullopt;
-    }
-
-    QRegion repair = infiniteRegion();
-    if (m_backend->supportsBufferAge()) {
-        repair = m_damageJournal.accumulate(m_bufferAge, infiniteRegion());
-    }
-
-    return OutputLayerBeginFrameInfo{
-        .renderTarget = RenderTarget(framebuffer()),
-        .repaint = repair,
-    };
+    return m_context->makeCurrent(m_surface);
 }
 
-void EglHwcomposerOutput::aboutToStartPainting(const QRegion &damagedRegion)
+void EglHwcBackend::doneCurrent()
 {
-    if (surface() && m_bufferAge > 0 && !damagedRegion.isEmpty() && m_backend->supportsPartialUpdate()) {
-        QVector<EGLint> rects = m_output->regionToRects(damagedRegion);
-        const bool correct = eglSetDamageRegionKHR(m_backend->eglDisplay(), surface(), rects.data(), rects.count() / 4);
-        if (!correct) {
-            qCWarning(KWIN_HWCOMPOSER) << "eglSetDamageRegionKHR failed:" << getEglErrorString();
-        }
-    }
-}
-
-bool EglHwcomposerOutput::endFrame(const QRegion &renderedRegion, const QRegion &damagedRegion)
-{
-    Q_UNUSED(renderedRegion)
-    m_currentDamage = damagedRegion;
-    return true;
-}
-
-void EglHwcomposerOutput::present()
-{
-    if (m_backend->supportsSwapBuffersWithDamage() && m_backend->supportsPartialUpdate()) {
-        QVector<EGLint> rects = m_output->regionToRects(m_currentDamage);
-        const bool correct = eglSwapBuffersWithDamageKHR(m_backend->eglDisplay(), surface(), rects.data(), rects.count() / 4);
-        if (!correct) {
-            qCWarning(KWIN_HWCOMPOSER) << "eglSwapBuffersWithDamageKHR failed:" << getEglErrorString();
-        }
-    } else {
-        const bool correct = eglSwapBuffers(m_backend->eglDisplay(), surface());
-        if (!correct) {
-            qCWarning(KWIN_HWCOMPOSER) << "eglSwapBuffers failed:" << getEglErrorString();
-        }
-    }
-
-    if (m_backend->supportsBufferAge()) {
-        eglQuerySurface(m_backend->eglDisplay(), surface(), EGL_BUFFER_AGE_EXT, &m_bufferAge);
-    }
-    m_damageJournal.add(m_currentDamage);
+    m_context->doneCurrent();
 }
 
 } // namespace KWin
