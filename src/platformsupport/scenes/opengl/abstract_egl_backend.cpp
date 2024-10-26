@@ -99,7 +99,6 @@ void AbstractEglBackend::initWayland()
     if (!WaylandServer::self()) {
         return;
     }
-
     if (DrmDevice *scanoutDevice = drmDevice()) {
         QString renderNode = m_display->renderNode();
         if (renderNode.isEmpty()) {

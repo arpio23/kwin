@@ -9,7 +9,7 @@
 
 #pragma once
 
-#include "abstract_egl_backend.h"
+#include "platformsupport/scenes/opengl/abstract_egl_backend.h"
 #include "core/outputlayer.h"
 #include "utils/common.h"
 #include "utils/damagejournal.h"
@@ -25,6 +25,7 @@ class HwcomposerBackend;
 class HwcomposerOutput;
 class HwcomposerWindow;
 class EglHwcomposerOutput; // Forward declaration
+class GLRenderTimeQuery;
 
 class EglHwcomposerBackend : public AbstractEglBackend
 {
@@ -32,11 +33,12 @@ public:
     EglHwcomposerBackend(HwcomposerBackend *backend);
     ~EglHwcomposerBackend() override;
 
-    std::unique_ptr<SurfaceTexture> createSurfaceTextureInternal(SurfacePixmapInternal *pixmap) override;
-    std::unique_ptr<SurfaceTexture> createSurfaceTextureWayland(SurfacePixmapWayland *pixmap) override;
+    std::unique_ptr<SurfaceTexture> createSurfaceTextureWayland(SurfacePixmap *pixmap) override;
     OutputLayer *primaryLayer(Output *output) override;
     void init() override;
-    void present(Output *output) override;
+    void present(Output *output, const std::shared_ptr<OutputFrame> &frame) override;
+    EGLConfig getConfig();
+    EGLConfig getContext();
 
 private:
     bool initializeEgl();
@@ -45,7 +47,9 @@ private:
     bool createEglHwcomposerOutput(Output *output);
     void cleanupSurfaces() override;
 
+    EGLConfig m_configs;
     HwcomposerBackend *m_backend;
+    std::shared_ptr<EglContext> m_context;
     std::map<Output *, std::unique_ptr<EglHwcomposerOutput>> m_outputs;
 };
 
@@ -55,10 +59,11 @@ public:
     EglHwcomposerOutput(HwcomposerOutput *output, EglHwcomposerBackend *backend);
     ~EglHwcomposerOutput() override;
 
-    std::optional<OutputLayerBeginFrameInfo> beginFrame() override;
-    void aboutToStartPainting(const QRegion &damagedRegion) override;
-    bool endFrame(const QRegion &renderedRegion, const QRegion &damagedRegion) override;
-    void present();
+    std::optional<OutputLayerBeginFrameInfo> doBeginFrame() override;
+    bool doEndFrame(const QRegion &renderedRegion, const QRegion &damagedRegion, OutputFrame *frame) override;
+
+    DrmDevice *scanoutDevice() const override;
+    QHash<uint32_t, QList<uint64_t>> supportedDrmFormats() const override;
 
     EGLSurface surface() const
     {
@@ -69,18 +74,25 @@ public:
         return m_framebuffer.get();
     }
 
+    OutputFrame *m_frame;
 private:
     bool makeContextCurrent() const;
 
     HwcomposerWindow *m_nativeSurface = nullptr;
     EGLSurface m_surface = EGL_NO_SURFACE;
     std::unique_ptr<GLFramebuffer> m_framebuffer;
-    QRegion m_currentDamage;
+    QRegion m_lastRenderedRegion;
     DamageJournal m_damageJournal;
+    // QRegion m_currentDamage;
+    // DamageJournal m_damageJournal;
     int m_bufferAge = 0;
 
     HwcomposerOutput *m_output;
     EglHwcomposerBackend *m_backend;
+
+    // std::shared_ptr<EglSwapchain> m_swapchain;
+    // std::shared_ptr<EglSwapchainSlot> m_current;
+    std::unique_ptr<GLRenderTimeQuery> m_query;
 };
 
 } // namespace KWin

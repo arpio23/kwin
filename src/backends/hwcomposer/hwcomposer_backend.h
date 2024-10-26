@@ -13,6 +13,7 @@
 #include "core/output.h"
 #include "core/outputbackend.h"
 #include "core/renderloop.h"
+#include "core/outputlayer.h"
 
 #include "dpmsinputeventfilter.h"
 #include "input.h"
@@ -36,6 +37,7 @@ namespace KWin
 {
 class HwcomposerWindow;
 class HwcomposerBackend;
+class OutputFrame;
 
 class HwcomposerOutput : public Output
 {
@@ -50,12 +52,13 @@ public:
     void updateEnabled(bool enabled);
     bool isEnabled() const;
     void resetStates();
-    void notifyFrame();
+    void notifyFrame(const std::shared_ptr<OutputFrame> &frame);
     void handleVSync(int64_t timestamp);
     HwcomposerWindow *createSurface();
     void enableVSync(bool enable);
     void setPowerMode(bool enable);
-    QVector<int32_t> regionToRects(const QRegion &region) const;
+    std::shared_ptr<OutputFrame> m_frame;
+    // QVector<int32_t> regionToRects(const QRegion &region) const;
 
     hwc2_compat_display_t *hwc2_display() const
     {
@@ -68,7 +71,7 @@ public:
     }
 
 private Q_SLOTS:
-    void compositing(int flags);
+    void compositing(int flags, const std::shared_ptr<OutputFrame> &frame);
 
 private:
     friend HwcomposerWindow;
@@ -105,6 +108,9 @@ public:
     void handleHotplug(hwc2_display_t display, bool connected, bool primaryDisplay);
     void updateOutputState(hwc2_display_t display);
 
+    EglDisplay *sceneEglDisplayObject() const override;
+    void setEglDisplay(std::unique_ptr<EglDisplay> &&display);
+
     QVector<CompositingType> supportedCompositors() const override
     {
         return QVector<CompositingType>{OpenGLCompositing};
@@ -122,7 +128,8 @@ private:
     std::map<hwc2_display_t, std::unique_ptr<HwcomposerOutput>> m_outputs;
     hwc2_compat_device_t *m_hwc2device = nullptr;
     std::unique_ptr<DpmsInputEventFilter> m_dpmsFilter;
-
+    std::unique_ptr<EglDisplay> m_display;
+    
     Session *m_session;
 };
 
